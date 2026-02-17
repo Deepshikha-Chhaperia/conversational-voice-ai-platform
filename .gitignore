@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments (Virtualenv)
+venv/
+.venv/
+env/
+
+# Environment Variables (Keep .env.example, ignore .env)
+.env
+
+# Logs
+logs/
+*.log
+
+# System Files
+.DS_Store
+Thumbs.db
+
+# IDE Settings
+.vscode/
+.idea/

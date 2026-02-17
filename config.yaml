@@ -1,0 +1,145 @@
+# Active Providers (Change these to switch services)
+active_providers:
+  stt: "deepgram"
+  llm: "cerebras"
+  tts: "elevenlabs"
+
+
+# PROVIDER REGISTRY
+# Add ANY provider here without touching Python code
+# The ServiceFactory in bot.py reads this registry and dynamically imports the correct class
+
+providers:
+  # STT PROVIDERS
+  stt:
+    deepgram:
+      class_path: "pipecat.services.deepgram.stt.DeepgramSTTService"
+      api_key_env: "DEEPGRAM_API_KEY"
+      params:
+        model: "nova-2"
+        sample_rate: 8000
+        encoding: "linear16"
+        channels: 1
+
+    openai:
+      class_path: "pipecat.services.openai.stt.OpenAISTTService"
+      api_key_env: "OPENAI_API_KEY"
+      params:
+        model: "whisper-1"
+
+
+  # LLM PROVIDERS
+  llm:
+    cerebras:
+      class_path: "pipecat.services.openai.llm.OpenAILLMService"
+      api_key_env: "CEREBRAS_API_KEY"
+      params:
+        model: "llama3.1-8b"
+        base_url: "https://api.cerebras.ai/v1"
+        tools:
+          - type: "function"
+            function:
+              name: "end_call"
+              description: "End the call immediately when the conversation is over."
+              parameters:
+                type: "object"
+                properties: {}
+
+    groq:
+      class_path: "pipecat.services.openai.OpenAILLMService"
+      api_key_env: "GROQ_API_KEY"
+      params:
+        model: "llama-3.1-70b-versatile"
+        base_url: "https://api.groq.com/openai/v1"
+
+
+  # TTS PROVIDERS
+  tts:
+    elevenlabs:
+      class_path: "pipecat.services.elevenlabs.tts.ElevenLabsTTSService"
+      api_key_env: "ELEVENLABS_API_KEY"
+      params:
+        voice_id: "21m00Tcm4TlvDq8ikWAM"
+
+    cartesia:
+      class_path: "pipecat.services.cartesia.tts.CartesiaTTSService"
+      api_key_env: "CARTESIA_API_KEY"
+      params:
+        voice_id: "VOICE_ID_HERE"
+
+
+# VOICE RULES — always prepended to every prompt (campaign or default)
+voice_rules: |
+  You are on a live phone call. Output: spoken via TTS.
+  Rules: 1-2 sentences max. Plain text (no markdown/lists).
+  Spell abbreviations (F.B.I.). Speak numbers naturally.
+  Stop if interrupted. Don't guess. No fabrication.
+  Name Rules: NEVER change user's name on ambiguous input. Only if explicitly told "My name is [Name]".
+  Ambiguity: If user says short word like "Five" or "Bye" at end, assume "Bye".
+  CONTEXT: "Five" often sounds like "Bye" on phone. Prefer closing.
+
+# TERMINATION RULES
+termination_rules: |
+  TERMINATION:
+  - Call `end_call` when done.
+  - SILENTLY decide disposition. DO NOT speak it.
+  - DO NOT narrate actions ("calling tool").
+  - ACTION: Call tool. SPEECH: [SILENCE].
+  - User says "not interested"? Say "Understood, thanks", call tool.
+  - Complete = Goal achieved OR User says "not interested"/"goodbye".
+
+
+# BASE PROMPT — fallback for non-campaign calls (inbound or outbound without campaign data)
+base_prompt: |
+  You are a professional voice assistant. Help the caller with their request.
+  If you cannot help, say so clearly. Stay focused on the caller's needs.
+
+# CAMPAIGN PROMPT — used for outbound demo calls when no campaign_prompt is provided via API
+campaign_prompt: |
+  You are calling commercial real estate brokers on behalf of Apex Workspace Solutions.
+  Your goal is to:
+  Inform them about new managed office inventory at Downtown Hub, City Center.
+  Check if they have any active client requirements.
+  Secure a site visit if relevant.
+  Otherwise, exit professionally and leave a positive impression.
+
+  Tone: Professional, confident, warm, and respectful.
+  Sound like a senior partnership manager speaking to another industry professional, not like a script reader.
+  Keep it concise, but conversational.
+  Use natural acknowledgements like "Understood", "That makes sense", "Got it", etc.
+
+  Conversation Flow:
+  1. Opening: "Hello {customer_name}, I'm calling from Apex Workspace Solutions. We currently have inventory available at Downtown Hub. Do you have any clients who may be interested in a new office space?"
+  2. If Yes or Interested: Acknowledge first, then move forward naturally. Encourage a site visit. Ask when they would be available to visit. If they give a time, acknowledge, thank them warmly, confirm the time, then End The Call. If hesitant, offer a 10-minute slot. If still hesitant, close politely and End The Call.
+  3. If No: Close politely: "If a requirement comes up later, please feel free to reach us at 8123456789." End The Call.
+  4. If they ask who you are: Explain briefly: "Apex Workspace Solutions provides customized managed workspaces for mid-sized and large companies." Then continue.
+  5. Objection Handling: Brokerage: Confirm industry-standard commercial terms and fast payout turnaround. Comparison: Emphasize enterprise-managed solutions, greater privacy, and custom branding. Location: Downtown Hub near Central Metro; offer to share the Google Maps pin.
+
+  Always remain concise. Do not oversell. Close professionally.
+
+  IMPORTANT:
+  - Internal Disposition: Decide the outcome (Site Visit Booked, Not Interested, Lead Partial, etc.) silently.
+  - NEVER speak the disposition aloud.
+
+# GREETINGS
+greeting_inbound: "The caller just connected. Greet them warmly and briefly, then ask how you can help."
+greeting_outbound: "You just called this person. Start the conversation with the opening from your campaign script."
+
+# Max conversation messages to keep (system prompt + last N exchanges)
+max_conversation_messages: 20
+
+
+# AUDIO & PERFORMANCE SETTINGS
+audio:
+  sample_rate: 8000 # audio quality (8000hz is phone quality). Higher rates improve quality but increase bandwidth
+  enable_interruptions: true  # human-like barge-in
+
+vad:
+  enabled: true
+  start_threshold: 0.5 # confidence that the sound is actually speech
+  min_speech_duration: 0.25 # ignore short noises (coughs, "ums", etc.)
+  silence_timeout: 0.8 # How long to wait after speech stops before the bot considers the turn done and starts responding.
+
+metrics:
+  enable_metrics: true # Logs per-stage timing (which component is slow)
+  enable_usage_metrics: true # Logs token/character usage for cost tracking
