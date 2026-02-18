@@ -1,7 +1,7 @@
 # Active Providers (Change these to switch services)
 active_providers:
   stt: "deepgram"
-  llm: "cerebras"
+  llm: "groq"
   tts: "elevenlabs"
 
 
@@ -34,7 +34,7 @@ providers:
       class_path: "pipecat.services.openai.llm.OpenAILLMService"
       api_key_env: "CEREBRAS_API_KEY"
       params:
-        model: "llama3.1-8b"
+        model: "gpt-oss-120b"
         base_url: "https://api.cerebras.ai/v1"
         tools:
           - type: "function"
@@ -49,8 +49,16 @@ providers:
       class_path: "pipecat.services.openai.OpenAILLMService"
       api_key_env: "GROQ_API_KEY"
       params:
-        model: "llama-3.1-70b-versatile"
+        model: "llama-3.3-70b-versatile"
         base_url: "https://api.groq.com/openai/v1"
+        tools:
+          - type: "function"
+            function:
+              name: "end_call"
+              description: "End the call immediately when the conversation is over."
+              parameters:
+                type: "object"
+                properties: {} 
 
 
   # TTS PROVIDERS
@@ -82,11 +90,11 @@ voice_rules: |
 # TERMINATION RULES
 termination_rules: |
   TERMINATION:
-  - Call `end_call` when done.
+  - When done, say a brief goodbye then call `end_call`. Example: "Thank you. Goodbye." → call end_call.
+  - NEVER output "end_call" as text. ONLY use it as a tool/function call.
   - SILENTLY decide disposition. DO NOT speak it.
-  - DO NOT narrate actions ("calling tool").
-  - ACTION: Call tool. SPEECH: [SILENCE].
-  - User says "not interested"? Say "Understood, thanks", call tool.
+  - DO NOT narrate internal actions.
+  - User says "not interested"? Say "Understood, thanks for your time. Goodbye." → call end_call.
   - Complete = Goal achieved OR User says "not interested"/"goodbye".
 
 
