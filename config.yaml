@@ -77,6 +77,7 @@ voice_rules: |
   Name Rules: NEVER change user's name on ambiguous input. Only if explicitly told "My name is [Name]".
   Ambiguity: If user says short word like "Five" or "Bye" at end, assume "Bye".
   CONTEXT: "Five" often sounds like "Bye" on phone. Prefer closing.
+  No Time Greetings: NEVER say "Good morning", "Good afternoon", or "Good evening". Just say "Bye" or "Goodbye" to close.
 
 # TERMINATION RULES
 termination_rules: |
