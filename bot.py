@@ -23,6 +23,7 @@ from pipecat.frames.frames import (
     EndTaskFrame,
     TTSSpeakFrame,
     BotStoppedSpeakingFrame,
+    UserStartedSpeakingFrame,
     FunctionCallResultProperties,
     LLMFullResponseEndFrame,
 )
@@ -49,7 +50,7 @@ logger.add("logs/voicebot_{time:YYYY-MM-DD}.log", rotation="1 day", retention="1
 
 STREAM_PROVIDER_CALL_IDS: dict[str, str] = {}
 
-# Global VAD Instance (Lazy Loaded)
+# Global VAD Instance
 VAD_ANALYZER = None
 
 class ServiceFactory:
@@ -330,13 +331,13 @@ async def run_bot(
             # 1. Silent Triggers: Matches should be STRIPPED and trigger hangup
             self.silent_termination_patterns = [
                 # Tool Narration: "Calling the tool", "Invoking end_call"
-                re.compile(r"(call|dial|invok|trigger|activat).*(tool|function|api)", re.IGNORECASE),
+                ("tool_narration", re.compile(r"\b(call|dial|invok|trigger|activat)\w*\s+(the\s+)?(tool|function|api)\b", re.IGNORECASE)),
                 # Explicit Termination commands meant for internal use
-                re.compile(r"(end|clos|terminat|finish|hang).*(call|conversation|session|up|tool)", re.IGNORECASE),
-                # Disposition Leaks: "Site visit booked"
-                re.compile(r"(site visit|inventory|lead).*(booked|sent|partial)", re.IGNORECASE),
+                ("explicit_command", re.compile(r"\b(end|clos|terminat|finish|hang)\w*\s+(the\s+)?(call|conversation|session|up|tool)\b", re.IGNORECASE)),
+                # Disposition Leaks
+                ("disposition_leak", re.compile(r"\b(site\s+visit|inventory|lead)\s+(is\s+)?(booked|sent|partial)\b", re.IGNORECASE)),
                 # Explicit Tags
-                re.compile(r"\[hangup\]|\[end\]", re.IGNORECASE),
+                ("explicit_tag", re.compile(r"\[hangup\]|\[end\]", re.IGNORECASE)),
             ]
 
             # 2. Spoken Triggers: Matches should be SPOKEN, then trigger hangup
@@ -348,12 +349,19 @@ async def run_bot(
             ]
 
         async def _hangup_after_bot_stop(self) -> None:
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(3.0)
 
             if not self._provider_hangup_sent:
                 await _force_provider_hangup("termination_after_bot_stop")
                 self._provider_hangup_sent = True
 
+            await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+
+        async def _schedule_hangup(self, delay: float) -> None:
+            await asyncio.sleep(delay)
+            if not self._provider_hangup_sent:
+                await _force_provider_hangup("termination_immediate")
+                self._provider_hangup_sent = True
             await self.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
 
         async def process_frame(self, frame, direction: FrameDirection):
@@ -364,15 +372,29 @@ async def run_bot(
 
             await super().process_frame(frame, direction)
 
+            # Handle Interruption: If user speaks, CANCEL termination
+            if direction == FrameDirection.DOWNSTREAM and isinstance(frame, UserStartedSpeakingFrame):
+                if self._termination_requested or self._waiting_for_bot_stop:
+                    logger.info(f"[{stream_id}] User interrupted termination! Cancelling hangup.")
+                    if self._hangup_task:
+                        self._hangup_task.cancel()
+                        self._hangup_task = None
+                    self._waiting_for_bot_stop = False
+                    self._termination_requested = False
+                    self._provider_hangup_sent = False
+                    shutdown_state["active"] = False # Open the gate again
+                await self.push_frame(frame, direction)
+                return
+
             if direction == FrameDirection.UPSTREAM and isinstance(frame, BotStoppedSpeakingFrame):
                 if self._waiting_for_bot_stop and not self._hangup_task:
-                    logger.info(f"[{stream_id}] Bot finished speaking. Hanging up in 2.0s.")
+                    logger.info(f"[{stream_id}] Bot finished speaking. Hanging up in 3.0s.")
                     self._hangup_task = asyncio.create_task(self._hangup_after_bot_stop())
                     self._waiting_for_bot_stop = False
                 await self.push_frame(frame, direction)
                 return
 
-            # End of LLM Response: Flush remaining buffer
+            # End of LLM Response -> Flush remaining buffer
             if direction == FrameDirection.DOWNSTREAM and isinstance(frame, LLMFullResponseEndFrame):
                 if self._buffer.strip() and not shutdown_state["active"]:
                      # Flush whatever is left in the buffer as a final spoken frame
@@ -390,9 +412,10 @@ async def run_bot(
                 cleaned_text = self._buffer
 
                 # Check Silent Patterns (Strip them)
-                for pattern in self.silent_termination_patterns:
+                for name, pattern in self.silent_termination_patterns:
                     if pattern.search(cleaned_text):
                         hangup_requested = True
+                        logger.info(f"[{stream_id}] Silent Termination Triggered by pattern: '{name}'")
                         cleaned_text = pattern.sub("", cleaned_text) # Remove the trigger phrase
                 
                 # Check Spoken Patterns (Keep them)
@@ -404,6 +427,9 @@ async def run_bot(
                             break
 
                 if hangup_requested:
+                    # Strip leading/trailing punctuation and whitespace
+                    cleaned_text = re.sub(r"^[.,!?\s]+|[.,!?\s]+$", "", cleaned_text)
+                    
                     logger.info(f"[{stream_id}] Termination Triggered. Buffer: '{self._buffer}'. Cleaned: '{cleaned_text}'")
                     
                     # Update state
@@ -504,11 +530,10 @@ async def run_bot(
         async def safety_timeout():
             await asyncio.sleep(300)  # 5 minutes
             logger.warning(f"[{stream_id}] Call exceeded 5 min, forcing hangup")
+            await _force_provider_hangup("hard_timeout")
             await task.cancel()
         
         asyncio.create_task(safety_timeout())
-
-        
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
