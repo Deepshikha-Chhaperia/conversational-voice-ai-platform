@@ -46,8 +46,6 @@ load_dotenv(override=True)
 # Configure logger to file (rotates daily, keeps 10 days)
 logger.add("logs/voicebot_{time:YYYY-MM-DD}.log", rotation="1 day", retention="10 days", level="DEBUG")
 
-logger.add("logs/voicebot_{time:YYYY-MM-DD}.log", rotation="1 day", retention="10 days", level="DEBUG")
-
 STREAM_PROVIDER_CALL_IDS: dict[str, str] = {}
 
 # Global VAD Instance
@@ -260,18 +258,37 @@ async def run_bot(
     # Shared shutdown state to coordinate between tool calls and frame processor
     shutdown_state = {"active": False}
 
-    # Register "end_call" function for LLM to hang up gracefully
+    end_call_pending = {"active": False}
+
+    # If the regex-based TerminationProcessor already caught a goodbye (shutdown_state is true),
+    # we skip injection. Otherwise, inject a TTS goodbye so the user always hears one.
     async def end_call_handler(function_name, tool_call_id, args, llm, context, result_callback):
-        logger.info(f"[{stream_id}] LLM invoked end_call function. Terminating call.")
-        shutdown_state["active"] = True
-        await _force_provider_hangup("llm_end_call")
-        await llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+        logger.info(f"[{stream_id}] LLM invoked end_call. shutdown_state={shutdown_state['active']}")
+        end_call_pending["active"] = True
+
+        if not shutdown_state["active"]:
+            # Regex didn't catch a goodbye yet — inject one via TTS
+            logger.info(f"[{stream_id}] No prior goodbye detected. Injecting TTS goodbye.")
+            await llm.push_frame(TTSSpeakFrame(text="Thank you for your time. Goodbye."), FrameDirection.DOWNSTREAM)
+
+        # Fallback: forcefully hang up after 8s if bot-stop handler doesn't catch it
+        async def _fallback_hangup():
+            await asyncio.sleep(8.0)
+            if not shutdown_state["active"]:
+                logger.info(f"[{stream_id}] end_call fallback hangup triggered.")
+                shutdown_state["active"] = True
+                await _force_provider_hangup("llm_end_call_fallback")
+                await llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+
+        asyncio.create_task(_fallback_hangup())
+
         await result_callback(
             {"status": "ending"},
             properties=FunctionCallResultProperties(run_llm=False),
         )
 
     llm.register_function("end_call", end_call_handler)
+
 
     # Build system prompt using two-layer architecture:
     # Layer 1: Voice rules (always on, compact TTS behavior constraints)
@@ -300,7 +317,7 @@ async def run_bot(
         system_prompt = f"{voice_rules}\n\n{base_prompt}\n\nCurrent time: {now}"
 
     # Append HANGUP instruction for ALL calls
-    # Modern termination: Signal end of call when goal is met or conversation is over.
+    # Signal end of call when goal is met or conversation is over.
     termination_rules = config.get("termination_rules", "")
     if termination_rules:
         system_prompt += f"\n\n{termination_rules}"
@@ -312,8 +329,14 @@ async def run_bot(
     # Starts with just the system prompt and grows as the conversation progresses.
     messages = [{"role": "system", "content": system_prompt}]
 
+    # Extract tools from LLM provider config so they are sent with every API request
+    llm_provider = active_providers["llm"]
+    llm_tools = config.get("providers", {}).get("llm", {}).get(llm_provider, {}).get("params", {}).get("tools", [])
+    if llm_tools:
+        logger.info(f"[{stream_id}] Registering {len(llm_tools)} tool(s) with LLM context: {[t.get('function', {}).get('name', '?') for t in llm_tools]}")
+
     #OpenAILLMContext stores the conversation history and lets Pipecat automatically add what the user says and what the bot replies.
-    context = OpenAILLMContext(messages)
+    context = OpenAILLMContext(messages, tools=llm_tools if llm_tools else None)
     context_aggregator = llm.create_context_aggregator(context)
 
     
@@ -326,10 +349,10 @@ async def run_bot(
             self._hangup_task = None
             self._buffer = ""  # Buffer for accumulating text frames
 
-
-
             # 1. Silent Triggers: Matches should be STRIPPED and trigger hangup
             self.silent_termination_patterns = [
+                # end_call text leak: LLM outputs "end_call" as text instead of tool call
+                ("end_call_leak", re.compile(r"\bend[_\s-]?call\b\.?", re.IGNORECASE)),
                 # Tool Narration: "Calling the tool", "Invoking end_call"
                 ("tool_narration", re.compile(r"\b(call|dial|invok|trigger|activat)\w*\s+(the\s+)?(tool|function|api)\b", re.IGNORECASE)),
                 # Explicit Termination commands meant for internal use
@@ -372,17 +395,20 @@ async def run_bot(
 
             await super().process_frame(frame, direction)
 
-            # Handle Interruption: If user speaks, CANCEL termination
+            # Handle Interruption: If user speaks during bot's farewell speech, cancel.
+            # But if bot already finished speaking (hangup_task running), do NOT cancel.
             if direction == FrameDirection.DOWNSTREAM and isinstance(frame, UserStartedSpeakingFrame):
-                if self._termination_requested or self._waiting_for_bot_stop:
-                    logger.info(f"[{stream_id}] User interrupted termination! Cancelling hangup.")
-                    if self._hangup_task:
-                        self._hangup_task.cancel()
-                        self._hangup_task = None
+                if self._waiting_for_bot_stop:
+                    # Bot is still speaking its goodbye — user interrupted mid-speech, cancel
+                    logger.info(f"[{stream_id}] User interrupted mid-goodbye. Cancelling hangup.")
                     self._waiting_for_bot_stop = False
                     self._termination_requested = False
                     self._provider_hangup_sent = False
-                    shutdown_state["active"] = False # Open the gate again
+                    shutdown_state["active"] = False
+                    end_call_pending["active"] = False
+                elif self._hangup_task:
+                    # Bot already finished speaking goodbye — hangup is committed, ignore
+                    logger.info(f"[{stream_id}] User spoke after goodbye. Hangup is committed, ignoring.")
                 await self.push_frame(frame, direction)
                 return
 
@@ -391,6 +417,13 @@ async def run_bot(
                     logger.info(f"[{stream_id}] Bot finished speaking. Hanging up in 3.0s.")
                     self._hangup_task = asyncio.create_task(self._hangup_after_bot_stop())
                     self._waiting_for_bot_stop = False
+                # end_call was invoked — bot finished speaking the goodbye, now hang up
+                elif end_call_pending["active"] and not self._hangup_task:
+                    logger.info(f"[{stream_id}] Bot finished speaking after end_call. Hanging up in 3.0s.")
+                    shutdown_state["active"] = True  # Now gate future output
+                    end_call_pending["active"] = False
+                    self._hangup_task = asyncio.create_task(self._hangup_after_bot_stop())
+
                 await self.push_frame(frame, direction)
                 return
 
@@ -418,7 +451,7 @@ async def run_bot(
                         logger.info(f"[{stream_id}] Silent Termination Triggered by pattern: '{name}'")
                         cleaned_text = pattern.sub("", cleaned_text) # Remove the trigger phrase
                 
-                # Check Spoken Patterns (Keep them)
+                # Check Spoken Patterns
                 if not hangup_requested: # Only check if not already triggered by silent custom commands
                     for pattern in self.spoken_termination_patterns:
                         if pattern.search(cleaned_text):
