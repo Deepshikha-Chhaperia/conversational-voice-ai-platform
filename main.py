@@ -17,12 +17,62 @@ from pipecat.transports.websocket.fastapi import (
 )
 from bot import run_bot
 
-CONFIG = None
+import redis.asyncio as redis
+import json
 
-# Pending campaign data for outbound calls, keyed by call_id (UUID).
-# Stored when /outbound is hit, consumed when the WebSocket connects.
-# In production with multiple servers, this would move to Redis.
-PENDING_CALLS: dict[str, dict] = {}
+class CallManager:
+    """
+    Manages campaign state for calls. 
+    Tries to use Redis for production readiness/scale.
+    Falls back to in-memory dictionary if Redis is unavailable (dev mode/failure).
+    """
+    def __init__(self):
+        self.redis: redis.Redis | None = None
+        self.memory: dict[str, dict] = {}
+    
+    async def connect(self, url: str = "redis://localhost"):
+        try:
+            client = redis.from_url(url, decode_responses=True)
+            await client.ping()
+            self.redis = client
+            logger.info(f"Connected to Redis at {url}")
+        except Exception as e:
+            self.redis = None
+            logger.warning(f"Redis connection failed ({e}). using IN-MEMORY storage.")
+
+    async def get(self, call_id: str) -> dict | None:
+        if self.redis:
+            try:
+                data = await self.redis.get(f"call:{call_id}")
+                return json.loads(data) if data else None
+            except Exception as e:
+                logger.error(f"Redis get failed: {e}")
+                return self.memory.get(call_id)
+        return self.memory.get(call_id)
+
+    async def save(self, call_id: str, data: dict, ttl: int = 300):
+        if self.redis:
+            try:
+                await self.redis.setex(f"call:{call_id}", ttl, json.dumps(data))
+                return
+            except Exception as e:
+                logger.error(f"Redis save failed: {e}")
+        self.memory[call_id] = data
+
+    async def delete(self, call_id: str):
+        if self.redis:
+            try:
+                await self.redis.delete(f"call:{call_id}")
+            except Exception as e:
+                logger.error(f"Redis delete failed: {e}")
+        self.memory.pop(call_id, None)
+
+    async def close(self):
+        if self.redis:
+            await self.redis.aclose()
+
+CONFIG = None
+CALL_MANAGER = CallManager()
 
 
 @asynccontextmanager
@@ -32,7 +82,7 @@ async def lifespan(app: FastAPI):
     This runs BEFORE the first request is served. If any service fails to
     initialize (bad API key, missing package), the server won't start.
     """
-    global CONFIG, SERVICES
+    global CONFIG, REDIS_CLIENT
 
     logger.info("Initializing voice bot services...")
 
@@ -40,12 +90,14 @@ async def lifespan(app: FastAPI):
     with open("config.yaml", "r") as f:
         CONFIG = yaml.safe_load(f)
 
-    # Load the config that defines which providers are active
-    with open("config.yaml", "r") as f:
-        CONFIG = yaml.safe_load(f)
+    # Initialize Redis (or fallback)
+    redis_url = os.getenv("REDIS_URL", "redis://localhost")
+    await CALL_MANAGER.connect(redis_url)
 
     logger.info("Voice bot config loaded.")
     yield
+    
+    await CALL_MANAGER.close()
     logger.info("Shutting down...")
 app = FastAPI(title="Plug-and-Play Voice Bot", lifespan=lifespan)
 
@@ -143,12 +195,14 @@ async def start_outbound_call(
 
     # Store campaign data so it can be retrieved when the WebSocket connects.
     call_id = str(uuid.uuid4())
-    PENDING_CALLS[call_id] = {
+    initial_data = {
         "customer_name": body.customer_name,
         "campaign_prompt": body.campaign_prompt,
         "greeting": body.greeting,
     }
-    logger.info(f"[{call_id}] Campaign data stored for outbound call")
+    # Store in Redis/Memory with 5 minute TTL (300s)
+    await CALL_MANAGER.save(call_id, initial_data)
+    logger.info(f"[{call_id}] Campaign data stored")
 
     # Build the answer_url dynamically from the current request host.
     # call_id is passed as query param so /outbound-answer can forward it to the WS.
@@ -177,7 +231,11 @@ async def start_outbound_call(
             result = response.json()
             provider_call_id = result.get("callId") or result.get("call_uuid") or result.get("uuid")
             if provider_call_id:
-                PENDING_CALLS[call_id]["provider_call_id"] = provider_call_id
+                # Update the record with provider call ID
+                campaign_data = await CALL_MANAGER.get(call_id)
+                if campaign_data:
+                    campaign_data["provider_call_id"] = provider_call_id
+                    await CALL_MANAGER.save(call_id, campaign_data)
             logger.info(f"Outbound call initiated to {body.to}, answer_url={answer_url}")
             return {"status": "success", "vobiz_response": result}
         except httpx.HTTPStatusError as e:
@@ -245,9 +303,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
         # 2. Retrieve campaign data for outbound calls (pop removes it from the store)
         call_id = websocket.query_params.get("call_id", "")
-        campaign_data = PENDING_CALLS.pop(call_id, None) if call_id else None
-        if campaign_data:
-            logger.info(f"Campaign data loaded for call {call_id}")
+        campaign_data = None
+        if call_id:
+            campaign_data = await CALL_MANAGER.get(call_id)
+            if campaign_data:
+                await CALL_MANAGER.delete(call_id)
+                logger.info(f"Campaign data loaded for call {call_id}")
 
         # 3. Run the bot pipeline with a maximum call duration so calls automatically stop if they run too long (default 15 minutes).
         max_duration = CONFIG.get("max_call_duration_seconds", 900)
